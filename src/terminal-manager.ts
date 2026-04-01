@@ -87,12 +87,14 @@ function getShellSpawnArgs(shellPath: string, command: string): ShellSpawnConfig
     };
   }
   
-  // Unknown/other shells - use shell option for safety
-  // This provides a fallback for shells we don't explicitly handle
-  return { 
-    executable: command,
-    args: [],
-    useShellOption: shellPath 
+  // Unknown/other shells (ksh, dash, ash, etc.) - use POSIX -c convention
+  // Consistent with bash/zsh/fish above; also avoids issues when shellPath
+  // contains spaces, which Node.js spawn() mishandles when shellPath is
+  // passed as the `shell` option rather than as the executable.
+  return {
+    executable: shellPath,
+    args: ['-c', command],
+    useShellOption: false
   };
 }
 
