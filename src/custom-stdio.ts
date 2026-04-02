@@ -33,8 +33,18 @@ export class FilteredStdioServerTransport extends StdioServerTransport {
   private clientName: string = 'unknown';
   private disableNotifications: boolean = false;
 
+  // Serialised write queue for notification/progress/custom writes.
+  // Ensures at most one `once('drain', ...)` listener is registered at a time,
+  // preventing the MaxListenersExceededWarning on process.stdout (#391).
+  private stdoutQueue: string[] = [];
+  private stdoutDraining: boolean = false;
+
   constructor() {
     super();
+
+    // Allow enough listeners for concurrent MCP response drain waits during
+    // heavy tool usage, without triggering false-positive MaxListeners warnings.
+    process.stdout.setMaxListeners(50);
     
     // Store original methods
     this.originalConsole = {
@@ -121,6 +131,39 @@ export class FilteredStdioServerTransport extends StdioServerTransport {
    */
   public get bufferedMessageCount(): number {
     return this.messageBuffer.length;
+  }
+
+  /**
+   * Write a serialised line to stdout via the notification write queue.
+   * At most one `once('drain', ...)` listener is registered at any time,
+   * preventing MaxListenersExceededWarning during heavy notification load.
+   */
+  private writeNotificationToStdout(data: string): void {
+    this.stdoutQueue.push(data);
+    if (!this.stdoutDraining) {
+      this.flushNotificationQueue();
+    }
+  }
+
+  private flushNotificationQueue(): void {
+    while (this.stdoutQueue.length > 0) {
+      const data = this.stdoutQueue[0];
+      const flushed = this.originalStdoutWrite.call(process.stdout, data);
+      if (flushed) {
+        this.stdoutQueue.shift();
+      } else {
+        // stdout buffer is full — wait for drain before writing more.
+        // Using once() ensures the listener is removed immediately after firing.
+        if (!this.stdoutDraining) {
+          this.stdoutDraining = true;
+          process.stdout.once('drain', () => {
+            this.stdoutDraining = false;
+            this.flushNotificationQueue();
+          });
+        }
+        return;
+      }
+    }
   }
 
   private setupConsoleRedirection() {
@@ -258,8 +301,9 @@ export class FilteredStdioServerTransport extends StdioServerTransport {
         }
       };
 
-      // Send as valid JSON-RPC notification
-      this.originalStdoutWrite.call(process.stdout, JSON.stringify(notification) + '\n');
+      // Route through the serialised write queue to avoid accumulating
+      // drain listeners on process.stdout during heavy notification load.
+      this.writeNotificationToStdout(JSON.stringify(notification) + '\n');
     } catch (error) {
       // Fallback to a simple JSON-RPC error notification if JSON serialization fails
       const fallbackNotification = {
@@ -271,7 +315,7 @@ export class FilteredStdioServerTransport extends StdioServerTransport {
           data: `Log serialization failed: ${args.join(' ')}`
         }
       };
-      this.originalStdoutWrite.call(process.stdout, JSON.stringify(fallbackNotification) + '\n');
+      this.writeNotificationToStdout(JSON.stringify(fallbackNotification) + '\n');
     }
   }
 
@@ -307,7 +351,7 @@ export class FilteredStdioServerTransport extends StdioServerTransport {
         }
       };
 
-      this.originalStdoutWrite.call(process.stdout, JSON.stringify(notification) + '\n');
+      this.writeNotificationToStdout(JSON.stringify(notification) + '\n');
     } catch (error) {
       // Fallback to basic JSON-RPC notification
       const fallbackNotification = {
@@ -319,7 +363,7 @@ export class FilteredStdioServerTransport extends StdioServerTransport {
           data: `sendLog failed: ${message}`
         }
       };
-      this.originalStdoutWrite.call(process.stdout, JSON.stringify(fallbackNotification) + '\n');
+      this.writeNotificationToStdout(JSON.stringify(fallbackNotification) + '\n');
     }
   }
 
@@ -343,7 +387,7 @@ export class FilteredStdioServerTransport extends StdioServerTransport {
         }
       };
       
-      this.originalStdoutWrite.call(process.stdout, JSON.stringify(notification) + '\n');
+      this.writeNotificationToStdout(JSON.stringify(notification) + '\n');
     } catch (error) {
       // Fallback to basic JSON-RPC notification for progress
       const fallbackNotification = {
@@ -355,7 +399,7 @@ export class FilteredStdioServerTransport extends StdioServerTransport {
           data: `Progress ${token}: ${value}${total ? `/${total}` : ''}`
         }
       };
-      this.originalStdoutWrite.call(process.stdout, JSON.stringify(fallbackNotification) + '\n');
+      this.writeNotificationToStdout(JSON.stringify(fallbackNotification) + '\n');
     }
   }
 
@@ -375,7 +419,7 @@ export class FilteredStdioServerTransport extends StdioServerTransport {
         params: params
       };
       
-      this.originalStdoutWrite.call(process.stdout, JSON.stringify(notification) + '\n');
+      this.writeNotificationToStdout(JSON.stringify(notification) + '\n');
     } catch (error) {
       // Fallback to basic JSON-RPC notification for custom notifications
       const fallbackNotification = {
@@ -387,7 +431,7 @@ export class FilteredStdioServerTransport extends StdioServerTransport {
           data: `Custom notification failed: ${method}: ${JSON.stringify(params)}`
         }
       };
-      this.originalStdoutWrite.call(process.stdout, JSON.stringify(fallbackNotification) + '\n');
+      this.writeNotificationToStdout(JSON.stringify(fallbackNotification) + '\n');
     }
   }
 
