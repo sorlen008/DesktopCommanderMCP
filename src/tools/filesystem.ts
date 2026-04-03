@@ -311,11 +311,83 @@ type PdfPayload = {
 type FileResultPayloads = PdfPayload;
 
 /**
+/**
+ * Validate that a URL is safe to fetch, blocking SSRF attack vectors.
+ *
+ * Rejects:
+ * - Non-HTTP(S) schemes (file://, ftp://, etc.)
+ * - Private / loopback IPv4 ranges: 127.x, 10.x, 172.16-31.x, 192.168.x
+ * - Link-local IPv4 (169.254.x.x) — used by AWS/GCP/Azure instance metadata
+ * - IPv6 loopback (::1) and unspecified (::)
+ * - Common internal hostnames (localhost, host.docker.internal, etc.)
+ *
+ * Note: does not perform DNS resolution, so DNS-rebinding attacks are not
+ * blocked here; a network-layer proxy or egress firewall is required for that.
+ *
+ * @throws Error with a descriptive message if the URL is disallowed.
+ */
+function validateFetchUrl(rawUrl: string): void {
+    let parsed: URL;
+    try {
+        parsed = new URL(rawUrl);
+    } catch {
+        throw new Error(`Invalid URL: ${rawUrl}`);
+    }
+
+    // Only allow HTTP and HTTPS
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+        throw new Error(`Blocked URL scheme "${parsed.protocol}" — only http: and https: are allowed`);
+    }
+
+    const hostname = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, ''); // strip IPv6 brackets
+
+    // Block loopback and unspecified IPv6
+    if (hostname === '::1' || hostname === '::' || hostname === '0:0:0:0:0:0:0:1') {
+        throw new Error(`Blocked request to loopback address: ${hostname}`);
+    }
+
+    // Block well-known internal hostnames
+    const blockedHostnames = new Set([
+        'localhost',
+        'host.docker.internal',
+        'metadata.google.internal',
+        'metadata.goog',
+    ]);
+    if (blockedHostnames.has(hostname)) {
+        throw new Error(`Blocked request to internal hostname: ${hostname}`);
+    }
+
+    // Block .local mDNS names
+    if (hostname.endsWith('.local')) {
+        throw new Error(`Blocked request to mDNS host: ${hostname}`);
+    }
+
+    // Parse dotted-decimal IPv4 to check private/link-local ranges
+    const ipv4Parts = hostname.split('.');
+    if (ipv4Parts.length === 4 && ipv4Parts.every(p => /^\d+$/.test(p))) {
+        const [a, b, c] = ipv4Parts.map(Number);
+        if (
+            a === 127 ||                              // 127.0.0.0/8  loopback
+            a === 10 ||                               // 10.0.0.0/8   private
+            (a === 172 && b >= 16 && b <= 31) ||     // 172.16-31.x  private
+            (a === 192 && b === 168) ||               // 192.168.0.0/16 private
+            (a === 169 && b === 254) ||               // 169.254.0.0/16 link-local (cloud metadata)
+            (a === 0)                                 // 0.x.x.x      unspecified
+        ) {
+            throw new Error(`Blocked request to private/reserved IP address: ${hostname}`);
+        }
+    }
+}
+
+/**
  * Read file content from a URL
  * @param url URL to fetch content from
  * @returns File content or file result with metadata
  */
 export async function readFileFromUrl(url: string): Promise<FileResult> {
+    // Validate URL before fetching to prevent SSRF attacks
+    validateFetchUrl(url);
+
     // Import the MIME type utilities
     const { isImageFile } = await import('./mime-types.js');
 
@@ -325,7 +397,9 @@ export async function readFileFromUrl(url: string): Promise<FileResult> {
 
     try {
         const response = await fetch(url, {
-            signal: controller.signal
+            signal: controller.signal,
+            // Disable automatic redirect following to prevent open-redirect → SSRF chains
+            redirect: 'error',
         });
 
         // Clear the timeout since fetch completed
@@ -375,9 +449,14 @@ export async function readFileFromUrl(url: string): Promise<FileResult> {
         clearTimeout(timeoutId);
 
         // Return error information instead of throwing
-        const errorMessage = error instanceof DOMException && error.name === 'AbortError'
+        const isTimeout = error instanceof DOMException && error.name === 'AbortError';
+        const isRedirect = error instanceof TypeError
+            && (error.message.includes('redirect') || error.message.includes('Redirect'));
+        const errorMessage = isTimeout
             ? `URL fetch timed out after ${FILE_OPERATION_TIMEOUTS.URL_FETCH}ms: ${url}`
-            : `Failed to fetch URL: ${error instanceof Error ? error.message : String(error)}`;
+            : isRedirect
+                ? `Blocked redirect from ${url} — use the final destination URL directly`
+                : `Failed to fetch URL: ${error instanceof Error ? error.message : String(error)}`;
 
         throw new Error(errorMessage);
     }
