@@ -311,7 +311,6 @@ type PdfPayload = {
 type FileResultPayloads = PdfPayload;
 
 /**
-/**
  * Validate that a URL is safe to fetch, blocking SSRF attack vectors.
  *
  * Rejects:
@@ -365,7 +364,7 @@ function validateFetchUrl(rawUrl: string): void {
     // Parse dotted-decimal IPv4 to check private/link-local ranges
     const ipv4Parts = hostname.split('.');
     if (ipv4Parts.length === 4 && ipv4Parts.every(p => /^\d+$/.test(p))) {
-        const [a, b, c] = ipv4Parts.map(Number);
+        const [a, b] = ipv4Parts.map(Number);
         if (
             a === 127 ||                              // 127.0.0.0/8  loopback
             a === 10 ||                               // 10.0.0.0/8   private
